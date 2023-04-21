@@ -1,0 +1,189 @@
+---
+title: "sPlotOpen Worldclim Modelling"
+format: html
+execute:
+  warning: false
+  message: false
+---
+
+
+
+```{r packages}
+library(sf)
+library(terra)
+library(tidyverse)
+library(caret)
+library(CAST)
+library(mapview)
+```
+
+
+
+## Input
+
+```{r}
+# 1. plots with response
+# 2. predictors
+# 3. model domain (country borders)
+# 4. predictor names
+# 5. response name
+
+plots = st_read("data/plots.gpkg", quiet = TRUE)
+predictors = rast("data/predictors.tif")
+modeldomain = st_read("data/modeldomain.gpkg", quiet = TRUE)
+predictor_names = names(predictors)
+response_name = "Species_richness"
+```
+
+
+
+## Preparations
+
+```{r}
+training_data = plots |> st_drop_geometry()
+
+knn_setup = CAST::knndm(tpoints = st_transform(plots, 4326),
+                        modeldomain = st_transform(modeldomain, 4326), 
+                        samplesize = 4000, k = 5)
+```
+
+
+```{r}
+plots$fold = knn_setup$clusters
+plot(knn_setup)
+```
+
+
+
+```{r}
+
+plot(predictors)
+
+mapview(modeldomain)+mapview(plots, zcol = "fold")
+
+
+```
+
+
+## RF Model with Random CV
+
+```{r}
+set.seed(1)
+rfmodel_rcv = caret::train(x = training_data |> select(all_of(predictor_names)),
+                           y = training_data |> pull(response_name),
+                           method = "ranger",
+                           num.trees = 100,
+                           tuneGrid = expand.grid(splitrule = "variance",
+                                           mtry = 2,
+                                           min.node.size = 5),
+                           trControl = trainControl(method = "cv",
+                                                    number = 5,
+                                                    savePredictions = TRUE),
+                           importance = "permutation")
+
+global_validation(rfmodel_rcv)
+plot(varImp(rfmodel_rcv))
+```
+
+
+
+
+```{r}
+rcv_prediction = predict(predictors, rfmodel_rcv, na.rm = TRUE)
+rcv_aoa = CAST::aoa(predictors, rfmodel_rcv)
+plot(rcv_aoa)
+rcv_aoa
+```
+
+
+```{r}
+#| layout-ncol: 2
+plot(rcv_prediction)
+plot(rcv_aoa$AOA)
+```
+
+
+## RF Model with Spatial CV
+
+```{r}
+set.seed(1)
+rfmodel_scv = caret::train(x = training_data |> select(all_of(predictor_names)),
+                           y = training_data |> pull(response_name),
+                           method = "ranger",
+                           num.trees = 100,
+                           tuneGrid = expand.grid(splitrule = "variance",
+                                           mtry = 2,
+                                           min.node.size = 5),
+                           trControl = trainControl(method = "cv",
+                                                    number = 5,
+                                                    index = knn_setup$indx_train,
+                                                    indexOut = knn_setup$indx_test,
+                                                    savePredictions = TRUE),
+                           importance = "permutation")
+
+global_validation(rfmodel_scv)
+
+```
+
+
+```{r}
+scv_aoa = CAST::aoa(predictors, rfmodel_scv)
+plot(scv_aoa)
+scv_aoa
+
+plot(scv_aoa$AOA)
+```
+
+
+
+
+
+## Feature Selection
+
+```{r}
+set.seed(2)
+ffs_knncv = CAST::ffs(predictors = training_data |> select(all_of(predictor_names)),
+                      response = training_data |> pull(response_name),
+                      method = "ranger",
+                      num.trees = 100,
+                      minVar = 4,
+                      tuneGrid = expand.grid(splitrule = "variance",
+                                             mtry = 2,
+                                             min.node.size = 5),
+                      trControl = trainControl(method = "cv",
+                                               number = 5,
+                                               index = knn_setup$indx_train,
+                                               indexOut = knn_setup$indx_test,
+                                               savePredictions = TRUE),
+                      importance = "permutation",
+                      verbose = FALSE)
+global_validation(ffs_knncv)
+ffs_knncv$selectedvars
+```
+
+
+
+```{r}
+knncv_prediction = predict(predictors, ffs_knncv, na.rm = TRUE)
+knncv_aoa = CAST::aoa(predictors, ffs_knncv)
+```
+
+
+```{r}
+#| layout-ncol: 2
+plot(knncv_prediction)
+plot(knncv_aoa$AOA)
+```
+
+
+```{r}
+knncv_calib = calibrate_aoa(knncv_aoa, model = ffs_knncv, multiCV = TRUE, length.out = 4)
+plot(knncv_calib$AOA$expected_RMSE)
+```
+
+
+
+
+
+
+
